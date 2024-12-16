@@ -21,7 +21,7 @@ import zotero_notion_sync.logging_config  # pylint: disable=unused-import; Thoug
 
 # Create a custom logger specifically for the current module (zotero_to_notion)
 ztn_logger = logging.getLogger(__name__)
-ztn_logger.setLevel(logging.DEBUG)
+ztn_logger.setLevel(logging.INFO)
 
 
 class ZoteroToNotion:
@@ -65,22 +65,60 @@ class ZoteroToNotion:
         """
 
         ztn_logger.debug("Fetching Zotero references...")
-        url = f"https://api.zotero.org/users/{self.config.ZOTERO_USER_ID}/items"
+        base_url = f"https://api.zotero.org/users/{self.config.ZOTERO_USER_ID}/items"
         params = {"format": "json"}
 
-        response = requests.get(
-            url, headers=self.zotero_headers, params=params, timeout=30
-        )
+        all_items = []  # Store all fetched items
+        next_url = base_url  # Start with the base URL
 
-        # Check if the request returns a valid response
-        try:
-            response_data = response.json()
-            ztn_logger.debug("References: %s", response_data)
-        except ValueError:
-            ztn_logger.error("Failed to parse response: %s", response.text)
-            return {}
+        while next_url:
+            ztn_logger.debug("Next URL: %s", next_url)
+            response = requests.get(
+                next_url, headers=self.zotero_headers, params=params, timeout=30
+            )
 
-        return response_data if response.status_code == 200 else []
+            # Check if the request is valid
+            if response.status_code != 200:
+                ztn_logger.error(
+                    "Failed to fetch Zotero references. Status code: %s",
+                    response.status_code,
+                )
+                return []
+
+            try:
+                # Add fetched items
+                response_data = response.json()
+                all_items.extend(response_data)
+
+                # Check if a "next" page exists in the "Link" header
+                if "Link" in response.headers:
+                    links = response.headers["Link"].split(", ")
+                    next_url = None  # Reset next_url
+
+                    for link in links:
+                        if 'rel="next' in link:
+                            next_url = link.split(";")[0].strip("<>")
+                            break
+                else:
+                    next_url = None  # No more pages
+
+                ztn_logger.debug("Current fetched count: %s", len(all_items))
+
+            except ValueError:
+                ztn_logger.error(
+                    "Failed to parse response: %s", response.text, exc_info=True
+                )
+                return []
+
+            except Exception as e:
+                ztn_logger.error(
+                    "An unexpected error occurred: %s", str(e), exc_info=True
+                )
+                raise
+
+        ztn_logger.debug("Total references fetched: %s", all_items)
+        ztn_logger.debug("References: %s", all_items)
+        return all_items
 
     def fetch_collections(self):
         """
@@ -116,17 +154,20 @@ class ZoteroToNotion:
         except ValueError:
             ztn_logger.error("Failed to parse JSON response: %s", response.text)
             return {}
+        except Exception as e:
+            ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
+            raise
 
         # Build a dictionary with collection ID as key and name as value
         collections = {}
 
         if response.status_code == 200 and response_data:
             for collection in response_data:
-                logging.debug("Collection Key: %s", collection["key"])
-                logging.debug("Collection Data: %s", collection["data"])
-                logging.debug("Collection Name: %s", collection["data"]["name"])
-                logging.debug("Response Data Type: %s", type(collection))
-                logging.debug("Collection Data Type: %s", type(collection["data"]))
+                ztn_logger.debug("Collection Key: %s", collection["key"])
+                ztn_logger.debug("Collection Data: %s", collection["data"])
+                ztn_logger.debug("Collection Name: %s", collection["data"]["name"])
+                ztn_logger.debug("Response Data Type: %s", type(collection))
+                ztn_logger.debug("Collection Data Type: %s", type(collection["data"]))
 
                 if (
                     isinstance(collection, dict)
@@ -202,6 +243,11 @@ class ZoteroToNotion:
             except ValueError:
                 # If parsing fails, move to the next format
                 continue
+            except Exception as e:
+                ztn_logger.error(
+                    "An unexpected error occurred: %s", str(e), exc_info=True
+                )
+                raise
         # Log a warning if no formats match
         ztn_logger.warning("Failed to parse date: %s. No formats match!", date_str)
 
@@ -288,6 +334,31 @@ class ZoteroToNotion:
 
         return []
 
+    def process_abstract(self, reference):
+        """
+        Process the abstractNote field to ensure it meets Notion's character limit.
+
+        Args:
+            reference (dict): The reference data containing the abstractNote.
+
+        Returns:
+            str: The truncated abstractNote with a maximum of 2000 characters.
+        """
+        abstract = reference.get("data", {}).get("abstractNote", "")
+        if abstract and isinstance(abstract, str):
+            if len(abstract) > 2000:
+                ztn_logger.warning(
+                    "Abstract is too long and has been truncated to 2000 characters."
+                )
+                truncated_abstract = abstract[:1997] + "..."
+                ztn_logger.debug("Truncated Abstract: %s", truncated_abstract)
+                return truncated_abstract
+
+            ztn_logger.debug("Valid Abstract: %s", abstract)
+            return abstract
+        else:
+            return ""
+
     # Method to update a reference in Notion if it already exists
     @validate_reference_with_key()
     def update_reference_in_notion(self, page_id, reference, collection_names):
@@ -323,6 +394,9 @@ class ZoteroToNotion:
 
         # Format Authors (comma-separated string)
         authors = self.format_authors(reference["data"].get("creators", []))
+
+        # Process Abstract (truncated to 2000 characters if too long)
+        abstract = self.process_abstract(reference)
 
         # Prepare data to upload in Notion
         data = {
@@ -363,11 +437,7 @@ class ZoteroToNotion:
                         {"text": {"content": reference["data"].get("DOI", "")}}
                     ]
                 },
-                "Abstract": {
-                    "rich_text": [
-                        {"text": {"content": reference["data"].get("abstractNote", "")}}
-                    ]
-                },
+                "Abstract": {"rich_text": [{"text": {"content": abstract}}]},
             }
         }
 
@@ -391,6 +461,9 @@ class ZoteroToNotion:
             # ztn_logger.debug(response_data)
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
+        except Exception as e:
+            ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
+            raise
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -447,6 +520,9 @@ class ZoteroToNotion:
         # Format Authors (comma-separated string)
         authors = self.format_authors(reference["data"].get("creators", []))
 
+        # Process Abstract (truncated to 2000 characters if too long)
+        abstract = self.process_abstract(reference)
+
         # Prepare the data for Notion
         data = {
             "parent": {"database_id": self.config.NOTION_DATABASE_ID},
@@ -488,11 +564,7 @@ class ZoteroToNotion:
                         {"text": {"content": reference["data"].get("DOI", "")}}
                     ]
                 },
-                "Abstract": {
-                    "rich_text": [
-                        {"text": {"content": reference["data"].get("abstractNote", "")}}
-                    ]
-                },
+                "Abstract": {"rich_text": [{"text": {"content": abstract}}]},
                 # Set a default value for the Status and Category field
                 "Status": {"status": {"name": "Not started"}},
                 "Category": {"select": {"name": "Academic"}},
@@ -521,6 +593,9 @@ class ZoteroToNotion:
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
             return
+        except Exception as e:
+            ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
+            raise
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -600,6 +675,9 @@ class ZoteroToNotion:
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
             return None
+        except Exception as e:
+            ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
+            raise
 
         if response.status_code == 200 and response_data:
             # Check if the result is a dictionary and has the required keys
@@ -669,7 +747,9 @@ class ZoteroToNotion:
                 collection_names = self.format_collection_names(
                     reference["data"].get("collections", []), collections
                 )
-                logging.debug("Collection names of '%s': %s", title, collection_names)
+                ztn_logger.debug(
+                    "Collection names of '%s': %s", title, collection_names
+                )
 
                 if self.find_reference_in_notion(title, collection_names):
                     ztn_logger.debug(
