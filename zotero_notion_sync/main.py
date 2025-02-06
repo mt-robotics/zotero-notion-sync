@@ -17,4 +17,4 @@ if __name__ == "__main__":
     zotero_to_notion = ZoteroToNotion(config)
 
     # Call the sync_zotero_to_notion method
-    zotero_to_notion.sync_zotero_to_notion()
+    zotero_to_notion.sync_all_references_to_notion()

@@ -400,6 +400,7 @@ class ZoteroToNotion:
 
         # Prepare data to upload in Notion
         data = {
+            "parent": {"database_id": self.config.NOTION_DATABASE_ID},
             "properties": {
                 "Collections": {
                     "multi_select": [
@@ -409,11 +410,11 @@ class ZoteroToNotion:
                     ]
                 },
                 "Authors": {"rich_text": [{"text": {"content": authors}}]},
-                "Source URL": {"url": reference["data"].get("URL", "")},
+                "Source URL": {"url": reference["data"].get("url", "")},
                 "Tags": {
                     "multi_select": [
                         {"name": tag["tag"]}
-                        for tag in reference["data"].get("tag", [])
+                        for tag in reference["data"].get("tags", [])
                         if isinstance(tag, dict) and "tag" in tag
                     ]
                 },
@@ -438,8 +439,9 @@ class ZoteroToNotion:
                     ]
                 },
                 "Abstract": {"rich_text": [{"text": {"content": abstract}}]},
-            }
+            },
         }
+        ztn_logger.debug("Data: %s", data)
 
         # Conditionally add date fields only if they have valid values
         if access_date:
@@ -451,27 +453,31 @@ class ZoteroToNotion:
 
         # Send update request to Notion
         url = f"https://api.notion.com/v1/pages/{page_id}"
-        response = requests.patch(
-            url, headers=self.notion_headers, data=json.dumps(data), timeout=30
-        )
 
         # Check if the request returns a valid response
         try:
+            response = requests.patch(
+                url, headers=self.notion_headers, data=json.dumps(data), timeout=30
+            )
             response_data = response.json()
-            # ztn_logger.debug(response_data)
+            ztn_logger.debug(response_data)
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
+            raise  # Parsing error needs to be handled by the caller
+        except requests.exceptions.RequestException as e:
+            ztn_logger.error("Network error occurred: %s", str(e), exc_info=True)
+            raise  # Network issues cannot be resolved here
         except Exception as e:
             ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
             raise
 
-        # Check if the request was successful
-        if response.status_code == 200:
-            ztn_logger.info("Updated '%s' in Notion.", reference["data"]["title"])
-        else:
-            ztn_logger.error(
-                "Failed to update '%s': %s", reference["data"]["title"], response_data
-            )
+        # # Check if the request was successful - this is a HIGHT LEVEL log which can be handled in the caller (like sync_reference_to_notion) instead
+        # if response.status_code == 200:
+        #     ztn_logger.info("Updated '%s' in Notion.", reference["data"]["title"])
+        # else:
+        #     ztn_logger.error(
+        #         "Failed to update '%s': %s", reference["data"]["title"], response_data
+        #     )
 
     @validate_reference_with_key()
     def add_reference_to_notion(self, reference, collection_names):
@@ -597,13 +603,13 @@ class ZoteroToNotion:
             ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
             raise
 
-        # Check if the request was successful
-        if response.status_code == 200:
-            ztn_logger.info("Added '%s' to Notion.", reference["data"]["title"])
-        else:
-            ztn_logger.error(
-                "Failed to add '%s': %s", reference["data"]["title"], response_data
-            )
+        # # Check if the request was successful
+        # if response.status_code == 200:
+        #     ztn_logger.info("Added '%s' to Notion.", reference["data"]["title"])
+        # else:
+        #     ztn_logger.error(
+        #         "Failed to add '%s': %s", reference["data"]["title"], response_data
+        #     )
 
     def find_reference_in_notion(self, title, collection_names):
         """
@@ -705,7 +711,7 @@ class ZoteroToNotion:
                 ]  # Generally, there shouldn't be duplicated entries, so there should only be one match (hence choosing the first match)
         return None
 
-    def sync_zotero_to_notion(self):
+    def sync_all_references_to_notion(self):
         """
         Synchronizes references from Zotero to a Notion database.
 
@@ -727,10 +733,10 @@ class ZoteroToNotion:
         """
 
         references = self.fetch_zotero_reference()
-        ztn_logger.debug("References: %s", references)
+        ztn_logger.debug("Fetched %d references from Zotero", len(references))
 
         collections = self.fetch_collections()
-        ztn_logger.debug("Collections: %s", collections)
+        ztn_logger.debug("Fetch %d collections from Zotero", len(collections))
 
         for reference in references:
 
@@ -751,14 +757,67 @@ class ZoteroToNotion:
                     "Collection names of '%s': %s", title, collection_names
                 )
 
-                if self.find_reference_in_notion(title, collection_names):
-                    ztn_logger.debug(
-                        "Reference: '%s' with Collection names: %s already exists in Notion. Skipping.",
-                        title,
-                        collection_names,
+                self.add_reference_to_notion(reference, collection_names)
+
+    def sync_reference_to_notion(self):
+        """
+        Update or add a single Zotero reference to Notion.
+
+        This method finds a reference in Zotero by the title provided by the user.
+        If the reference exists in Notion, it updates it. Otherwise, it adds it to Notion.
+        """
+        # Title input by user to update or add to Notion
+        search_title = input("Enter the title to update or add: ")
+        ztn_logger.info("Starting sync for reference: '%s'", search_title)
+
+        try:
+            # Fetch all references and collection names in Zotero
+            references = self.fetch_zotero_reference()
+            collections = self.fetch_collections()
+
+        except requests.exceptions.RequestException as e:
+            ztn_logger.error("Failed to fetch data from Zotero: '%s'", str(e))
+
+        # Process references
+        for reference in references:
+            if (
+                reference
+                and "data" in reference
+                and isinstance(reference["data"], dict)
+                and reference["data"].get("title") == search_title
+            ):
+                # Get collection names for the reference
+                collection_names = self.format_collection_names(
+                    collection_ids=reference["data"]["collections"],
+                    collections=collections,
+                )
+
+                try:
+                    # Check if the reference already exists in Notion
+                    notion_page_id = self.find_reference_in_notion(
+                        title=search_title, collection_names=collection_names
                     )
-                else:
-                    self.add_reference_to_notion(reference, collection_names)
+                    # Update if it exists
+                    if notion_page_id:
+                        self.update_reference_in_notion(
+                            notion_page_id,
+                            reference,
+                            collection_names,
+                        )
+                        ztn_logger.info(
+                            "Updated reference '%s' in Notion.", search_title
+                        )
+                    else:
+                        self.add_reference_to_notion(reference, collection_names)
+                        ztn_logger.info("Added reference '%s' to Notion.", search_title)
+
+                except Exception as e:
+                    ztn_logger.error(
+                        "Failed to process reference '%s': %s", search_title, str(e)
+                    )
+                return  # Exit after processing the matching reference
+
+        ztn_logger.warning("No matching reference found for '%s'.", search_title)
 
 
 # Temporary main function for testing
@@ -772,7 +831,9 @@ if __name__ == "__main__":
 
     # zotero_to_notion.fetch_collections()
 
-    # zotero_to_notion.find_reference_in_notion('A Review of the Role of Artificial Intelligence in Healthcare', [])
+    # zotero_to_notion.find_reference_in_notion(
+    #     "A Review of the Role of Artificial Intelligence in Healthcare", ["AI"]
+    # )
 
     # print(zotero_to_notion.notion_headers)
     # result = zotero_to_notion.find_reference_in_notion("AI-Driven Privacy in Elderly Care: Developing a Comprehensive Solution for Camera-Based Monitoring of Older Adults")
@@ -780,3 +841,5 @@ if __name__ == "__main__":
 
     # references = zotero_to_notion.fetch_zotero_reference()
     # zotero_to_notion.add_reference_to_notion(references[0])
+
+    zotero_to_notion.sync_reference_to_notion()
