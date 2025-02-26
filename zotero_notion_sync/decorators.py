@@ -46,7 +46,7 @@ def validate_creators_list(creators):
     return True
 
 
-def validate_reference_with_key(required_key="data"):
+def validate_reference_with_key(required_key="data", param_position=1):
     """
     Decorator to validate the `reference` argument of a method for the presence of a specified key.
 
@@ -57,6 +57,8 @@ def validate_reference_with_key(required_key="data"):
 
     Args:
         required_key (str): The key that must be present in the `reference` dictionary. Defaults to "data".
+        param_position (int): The position of the reference parameter (0-indexed, excluding self).
+                             Defaults to 1 (second parameter after self).
 
     Returns:
         function: The wrapped function with the added validation.
@@ -68,17 +70,26 @@ def validate_reference_with_key(required_key="data"):
         @validate_reference_with_key("data")
         def process_reference(self, reference):
             ...
+            
+        @validate_reference_with_key("data", param_position=2)
+        def update_reference(self, page_id, reference, collection_names):
+            ...
     """
 
     def decorator(func):
         @wraps(func)
-        def wrapper(self, reference, *args, **kwargs):
+        def wrapper(self, *args, **kwargs):
             try:
-                if not validate_key(reference, required_key):
-                    raise InvalidReferenceError(
-                        f"Missing key '{required_key}' in reference."
-                    )
-                return func(self, reference, *args, **kwargs)
+                # Get the reference parameter based on position
+                if len(args) > param_position:
+                    reference = args[param_position]
+                    
+                    if not validate_key(reference, required_key):
+                        raise InvalidReferenceError(
+                            f"Missing key '{required_key}' in reference."
+                        )
+                    
+                return func(self, *args, **kwargs)
             except InvalidReferenceError as e:
                 logging.error("Validation error: %s", e)
                 return None

@@ -189,22 +189,23 @@ class ZoteroToNotion:
 
         return collections
 
-    def parse_date(self, date_str):
+    def parse_date(self, date_str, include_time=False):
         """
-        Parse a date string and format it to "YYYY-MM-DD".
+        Parse a date string and format it to "YYYY-MM-DD" or "YYYY-MM-DDThh:mm:ss" if include_time is True.
 
         This method attempts to parse an input date string using various date
         formats from the most to least specific. If parsing is successful, it
-        returns the date in a format compatible with Notion ("YYYY-MM-DD"). If
-        the input cannot be parsed using the supported formats or if it is empty,
-        the method logs a warning and returns None.
+        returns the date in a format compatible with Notion. If the input cannot 
+        be parsed using the supported formats or if it is empty, the method logs 
+        a warning and returns None.
 
         Args:
             date_str (str): The date string to be parsed.
+            include_time (bool): Whether to include time in the output format. Default is False.
 
         Returns:
-            str or None: The formatted date as a string in "YYYY-MM-DD" format
-                        if parsing is successful; None otherwise.
+            str or None: The formatted date as a string in "YYYY-MM-DD" format or "YYYY-MM-DDThh:mm:ss"
+                        if include_time is True and parsing is successful; None otherwise.
 
         Raises:
             ValueError: If the provided date string does not match any of the
@@ -213,6 +214,9 @@ class ZoteroToNotion:
         Example:
             formatted_date = self.parse_date("2023-05-15T13:34:41+00:00")
             # Output: "2023-05-15"
+            
+            formatted_date_time = self.parse_date("2023-05-15T13:34:41+00:00", include_time=True)
+            # Output: "2023-05-15T13:34:41"
 
         Note:
             The method tries parsing the date string with the following formats:
@@ -238,8 +242,13 @@ class ZoteroToNotion:
                 # Try to parse the date with the current format
                 parsed_date = datetime.strptime(date_str, date_format)
 
-                # Format the parsed date to "YYYY-MM-DD" for Notion compatibility
-                return parsed_date.strftime("%Y-%m-%d")
+                # Format the parsed date based on whether time should be included
+                if include_time and "%H:%M:%S" in date_format:
+                    # Include time if available and requested
+                    return parsed_date.strftime("%Y-%m-%dT%H:%M:%S")
+                else:
+                    # Otherwise just return the date
+                    return parsed_date.strftime("%Y-%m-%d")
             except ValueError:
                 # If parsing fails, move to the next format
                 continue
@@ -358,9 +367,90 @@ class ZoteroToNotion:
             return abstract
         else:
             return ""
+            
+    def should_update_reference(self, notion_modified_date, zotero_modified_date):
+        """
+        Compares Notion's Modified Date with Zotero's Date Modified to determine if an update is needed.
+        
+        Args:
+            notion_modified_date (str): The date string from Notion's Modified Date field.
+            zotero_modified_date (str): The date string from Zotero's dateModified field.
+            
+        Returns:
+            bool: True if the Zotero date is more recent or if either date is missing, False otherwise.
+        """
+        if not notion_modified_date or not zotero_modified_date:
+            # If either date is missing, we should update to be safe
+            ztn_logger.debug("Missing date information, will update reference.")
+            return True
+            
+        try:
+            # Parse both dates to datetime objects for comparison
+            # Notion date could be with or without time
+            notion_date = None
+            notion_formats = [
+                "%Y-%m-%dT%H:%M:%S",  # Notion date with time
+                "%Y-%m-%d"            # Notion date without time
+            ]
+            
+            for date_format in notion_formats:
+                try:
+                    notion_date = datetime.strptime(notion_modified_date, date_format)
+                    break
+                except ValueError:
+                    continue
+            
+            if not notion_date:
+                ztn_logger.warning(f"Could not parse Notion date format: {notion_modified_date}")
+                return True
+            
+            # Zotero date could be in various formats, try to parse it
+            zotero_date = None
+            zotero_formats = [
+                "%Y-%m-%dT%H:%M:%S%z",  # Full ISO format with timezone
+                "%Y-%m-%dT%H:%M:%S",    # ISO format without timezone
+                "%Y-%m-%d",             # Simple date format
+            ]
+            
+            for date_format in zotero_formats:
+                try:
+                    zotero_date = datetime.strptime(zotero_modified_date, date_format)
+                    break
+                except ValueError:
+                    continue
+                    
+            if not zotero_date:
+                # Couldn't parse Zotero date, so update to be safe
+                ztn_logger.warning(f"Could not parse Zotero date format: {zotero_modified_date}")
+                return True
+            
+            # If we have dates with time, compare precise timestamps
+            if "T" in notion_modified_date and "T" in zotero_modified_date:
+                ztn_logger.debug(f"Comparing datetimes - Notion: {notion_date}, Zotero: {zotero_date}")
+                
+                # Convert to naive datetime objects for comparison if needed
+                if notion_date.tzinfo is None and zotero_date.tzinfo is not None:
+                    zotero_date = zotero_date.replace(tzinfo=None)
+                
+                # Update if Zotero's datetime is more recent
+                return zotero_date > notion_date
+            else:
+                # Fall back to date-only comparison if either doesn't have time
+                notion_date_only = notion_date.date()
+                zotero_date_only = zotero_date.date()
+                
+                ztn_logger.debug(f"Comparing dates - Notion: {notion_date_only}, Zotero: {zotero_date_only}")
+                
+                # Update if Zotero's date is more recent
+                return zotero_date_only > notion_date_only
+            
+        except Exception as e:
+            ztn_logger.warning(f"Error comparing dates: {str(e)}")
+            # If there's any error in comparison, update to be safe
+            return True
 
     # Method to update a reference in Notion if it already exists
-    @validate_reference_with_key()
+    @validate_reference_with_key(param_position=1)
     def update_reference_in_notion(self, page_id, reference, collection_names):
         """
         Update an existing reference in Notion with formatted data from Zotero.
@@ -388,9 +478,15 @@ class ZoteroToNotion:
             - Warnings and debug logs may be present from helper methods for specific data processing.
         """
 
+        # with open("added_reference.json", "w", encoding="utf-8") as f:
+        #     json.dump(reference, f, ensure_ascii=False, indent=4)
+
         # Format Access Date and Publication Date to be compatible with Notion: YYYY-MM-DD
         access_date = self.parse_date(reference["data"].get("accessDate", ""))
         publication_date = self.parse_date(reference["data"].get("date", ""))
+        
+        # Format Modified Date from Zotero - include time for more precise tracking
+        modified_date = self.parse_date(reference["data"].get("dateModified", ""), include_time=True)
 
         # Format Authors (comma-separated string)
         authors = self.format_authors(reference["data"].get("creators", []))
@@ -410,7 +506,7 @@ class ZoteroToNotion:
                     ]
                 },
                 "Authors": {"rich_text": [{"text": {"content": authors}}]},
-                "Source URL": {"url": reference["data"].get("url", "")},
+                "Source URL": {"url": reference["data"].get("url") or None},
                 "Tags": {
                     "multi_select": [
                         {"name": tag["tag"]}
@@ -450,6 +546,9 @@ class ZoteroToNotion:
             data["properties"]["Publication Date"] = {
                 "date": {"start": publication_date}
             }
+        # Always update the Modified Date with the latest date from Zotero
+        if modified_date:
+            data["properties"]["Modified Date"] = {"date": {"start": modified_date}}
 
         # Send update request to Notion
         url = f"https://api.notion.com/v1/pages/{page_id}"
@@ -479,7 +578,7 @@ class ZoteroToNotion:
         #         "Failed to update '%s': %s", reference["data"]["title"], response_data
         #     )
 
-    @validate_reference_with_key()
+    @validate_reference_with_key(param_position=0)
     def add_reference_to_notion(self, reference, collection_names):
         """
         Adds a reference to the Notion database or updates it if it already exists.
@@ -503,6 +602,9 @@ class ZoteroToNotion:
                                 the required key or format.
         """
 
+        # with open("added_reference.json", "w", encoding="utf-8") as f:
+        #     json.dump(reference, f, ensure_ascii=False, indent=4)
+
         # Check if the reference already exists in Notion by retrieving its ID (a.k.a, page ID)
         page_id = self.find_reference_in_notion(
             reference["data"]["title"], collection_names
@@ -522,6 +624,8 @@ class ZoteroToNotion:
         # Format Access Data and Publication Date to be compatible with Notion: YYYY-MM-DD
         access_date = self.parse_date(reference["data"].get("accessDate", ""))
         publication_date = self.parse_date(reference["data"].get("date", ""))
+        # Format Modified Date with time for precise tracking
+        modified_date = self.parse_date(reference["data"].get("dateModified", ""), include_time=True)
 
         # Format Authors (comma-separated string)
         authors = self.format_authors(reference["data"].get("creators", []))
@@ -542,7 +646,7 @@ class ZoteroToNotion:
                     ]
                 },
                 "Authors": {"rich_text": [{"text": {"content": authors}}]},
-                "Source URL": {"url": reference["data"].get("url", "")},
+                "Source URL": {"url": reference["data"].get("url") or None},
                 "Tags": {
                     "multi_select": [
                         {"name": tag["tag"]}
@@ -584,18 +688,20 @@ class ZoteroToNotion:
             data["properties"]["Publication Date"] = {
                 "date": {"start": publication_date}
             }
+        # Always add the Modified Date with the latest date from Zotero for new entries
+        if modified_date:
+            data["properties"]["Modified Date"] = {"date": {"start": modified_date}}
 
         # Send data to Notion
         url = "https://api.notion.com/v1/pages"
 
-        response = requests.post(
-            url, headers=self.notion_headers, data=json.dumps(data), timeout=30
-        )
-
         # Check if the request returns a valid response
         try:
+            response = requests.post(
+                url, headers=self.notion_headers, data=json.dumps(data), timeout=30
+            )
             response_data = response.json()
-            # ztn_logger.debug(response_data)
+            ztn_logger.debug(response_data)
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
             return
@@ -625,7 +731,8 @@ class ZoteroToNotion:
             collection_names (list): A list of collection names to filter the search by.
 
         Returns:
-            str or None: The page ID of the found reference if it exists; None if no match is found.
+            tuple: A tuple containing (page_id, modified_date) if the reference exists, 
+                  or (None, None) if no match is found.
 
         Raises:
             ValueError: If the response from the Notion API cannot be parsed.
@@ -680,7 +787,7 @@ class ZoteroToNotion:
             ztn_logger.debug("Response data parsed: %s", response_data)
         except ValueError:
             ztn_logger.error("Failed to parse response: %s", response.text)
-            return None
+            return None, None
         except Exception as e:
             ztn_logger.error("An unexpected error occurred: %s", str(e), exc_info=True)
             raise
@@ -703,13 +810,24 @@ class ZoteroToNotion:
                     collection_names,
                 )
 
-            # If a result is found, return the page ID for updating using the update_reference_in_notion method
+            # If a result is found, return the page ID and modified date
             if results:
-                ztn_logger.debug("Page ID: %s", results[0]["id"])
-                return results[0][
-                    "id"
-                ]  # Generally, there shouldn't be duplicated entries, so there should only be one match (hence choosing the first match)
-        return None
+                page_id = results[0]["id"]
+                ztn_logger.debug("Page ID: %s", page_id)
+                
+                # Try to extract the Modified Date if it exists in the properties
+                modified_date = None
+                try:
+                    properties = results[0].get("properties", {})
+                    if "Modified Date" in properties and properties["Modified Date"].get("date"):
+                        modified_date = properties["Modified Date"]["date"].get("start")
+                        ztn_logger.debug("Notion Modified Date: %s", modified_date)
+                except Exception as e:
+                    ztn_logger.warning("Could not extract Modified Date: %s", str(e))
+                
+                return page_id, modified_date
+        
+        return None, None
 
     def sync_all_references_to_notion(self):
         """
@@ -732,11 +850,15 @@ class ZoteroToNotion:
             None: This function does not return any values. It performs operations to sync data between Zotero and Notion.
         """
 
-        references = self.fetch_zotero_reference()
-        ztn_logger.debug("Fetched %d references from Zotero", len(references))
+        try:
+            references = self.fetch_zotero_reference()
+            # ztn_logger.debug("Fetched %d references from Zotero", len(references))
 
-        collections = self.fetch_collections()
-        ztn_logger.debug("Fetch %d collections from Zotero", len(collections))
+            collections = self.fetch_collections()
+            # ztn_logger.debug("Fetch %d collections from Zotero", len(collections))
+
+        except requests.exceptions.RequestException as e:
+            ztn_logger.error("Failed to fetch data from Zotero: '%s'", str(e))
 
         for reference in references:
 
@@ -753,11 +875,38 @@ class ZoteroToNotion:
                 collection_names = self.format_collection_names(
                     reference["data"].get("collections", []), collections
                 )
-                ztn_logger.debug(
-                    "Collection names of '%s': %s", title, collection_names
-                )
+                # ztn_logger.debug(
+                #     "Collection names of '%s': %s", title, collection_names
+                # )
 
-                self.add_reference_to_notion(reference, collection_names)
+                try:
+                    # Check if the reference already exists in Notion
+                    notion_page_id, notion_modified_date = self.find_reference_in_notion(
+                        title=title, collection_names=collection_names
+                    )
+                    
+                    # Get Zotero's modified date
+                    zotero_modified_date = reference["data"].get("dateModified", "")
+                    
+                    # Update if it exists and needs updating
+                    if notion_page_id:
+                        if self.should_update_reference(notion_modified_date, zotero_modified_date):
+                            self.update_reference_in_notion(
+                                notion_page_id,
+                                reference,
+                                collection_names,
+                            )
+                            ztn_logger.info("Updated reference '%s' in Notion.", title)
+                        else:
+                            ztn_logger.info("Reference '%s' is already up to date in Notion, skipping.", title)
+                    else:
+                        self.add_reference_to_notion(reference, collection_names)
+                        ztn_logger.info("Added reference '%s' to Notion.", title)
+
+                except Exception as e:
+                    ztn_logger.error(
+                        "Failed to process reference '%s': %s", title, str(e)
+                    )
 
     def sync_reference_to_notion(self):
         """
@@ -773,6 +922,8 @@ class ZoteroToNotion:
         try:
             # Fetch all references and collection names in Zotero
             references = self.fetch_zotero_reference()
+            with open("fetched_references.json", "w", encoding="utf-8") as f:
+                json.dump(references, f, ensure_ascii=False, indent=4)
             collections = self.fetch_collections()
 
         except requests.exceptions.RequestException as e:
@@ -780,6 +931,9 @@ class ZoteroToNotion:
 
         # Process references
         for reference in references:
+            ztn_logger.debug("Processing reference: %s", reference)
+            ztn_logger.debug("Search title: %s", search_title)
+            ztn_logger.debug("Reference title: %s", reference["data"]["title"])
             if (
                 reference
                 and "data" in reference
@@ -791,22 +945,30 @@ class ZoteroToNotion:
                     collection_ids=reference["data"]["collections"],
                     collections=collections,
                 )
+                ztn_logger.debug("Fetched collection names: %s", collection_names)
 
                 try:
                     # Check if the reference already exists in Notion
-                    notion_page_id = self.find_reference_in_notion(
+                    notion_page_id, notion_modified_date = self.find_reference_in_notion(
                         title=search_title, collection_names=collection_names
                     )
-                    # Update if it exists
+                    
+                    # Get Zotero's modified date
+                    zotero_modified_date = reference["data"].get("dateModified", "")
+                    
+                    # Update if it exists and needs updating
                     if notion_page_id:
-                        self.update_reference_in_notion(
-                            notion_page_id,
-                            reference,
-                            collection_names,
-                        )
-                        ztn_logger.info(
-                            "Updated reference '%s' in Notion.", search_title
-                        )
+                        if self.should_update_reference(notion_modified_date, zotero_modified_date):
+                            self.update_reference_in_notion(
+                                notion_page_id,
+                                reference,
+                                collection_names,
+                            )
+                            ztn_logger.info(
+                                "Updated reference '%s' in Notion.", search_title
+                            )
+                        else:
+                            ztn_logger.info("Reference '%s' is already up to date in Notion, skipping.", search_title)
                     else:
                         self.add_reference_to_notion(reference, collection_names)
                         ztn_logger.info("Added reference '%s' to Notion.", search_title)
@@ -843,3 +1005,18 @@ if __name__ == "__main__":
     # zotero_to_notion.add_reference_to_notion(references[0])
 
     zotero_to_notion.sync_reference_to_notion()
+    # zotero_to_notion.find_reference_in_notion(
+    #     title="The Advantages and Disadvantages of AI in Elder Care",
+    #     collection_names=["AI"],
+    # )
+
+    # Fetch zotero references and save it to a file
+    # references = zotero_to_notion.fetch_zotero_reference()
+
+    # # Save references to a file
+    # with open("zotero_references.json", "w", encoding="utf-8") as f:
+    #     json.dump(references, f, indent=4)
+
+    # # Save the first reference's data to a file
+    # with open("zotero_references_data.json", "w", encoding="utf-8") as f:
+    #     json.dump(references[0]["data"], f, indent=4)
